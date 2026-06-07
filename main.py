@@ -1,8 +1,20 @@
 #!/usr/bin/env python3
 """NetCrawler — AI-powered pentesting agent."""
 from __future__ import annotations
+import logging
+import sys
 import typer
 from tui.app import NetCrawlerApp
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stderr),
+    ]
+)
+logger = logging.getLogger(__name__)
 
 app = typer.Typer(
     add_completion=False,
@@ -84,21 +96,42 @@ def run(
         "--verbose", "-v",
         help="Show raw tool output alongside AI interpretation",
     ),
+    debug: bool = typer.Option(
+        False,
+        "--debug", "-d",
+        help="Enable debug logging",
+    ),
 ):
     """Scan a TARGET using the AI-driven agent."""
+    if debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+        logger.debug("Debug logging enabled")
+    
     if profile not in PROFILES:
         typer.echo(f"[!] Unknown profile '{profile}'. Choose from: {', '.join(PROFILES)}")
         raise typer.Exit(1)
 
-    tui = NetCrawlerApp(
-        target=target,
-        model=model,
-        profile=profile,
-        scope=scope,
-        verbose=verbose,
-        timeout_minutes=timeout,
-    )
-    tui.run()
+    logger.info(f"Starting NetCrawler scan: target={target}, profile={profile}, model={model}")
+    
+    try:
+        tui = NetCrawlerApp(
+            target=target,
+            model=model,
+            profile=profile,
+            scope=scope,
+            verbose=verbose,
+            timeout_minutes=timeout,
+        )
+        tui.run()
+        logger.info("Scan completed successfully")
+    except KeyboardInterrupt:
+        logger.warning("Scan interrupted by user")
+        typer.echo("\n[!] Scan interrupted by user")
+        raise typer.Exit(130)
+    except Exception as e:
+        logger.error(f"Scan failed with error: {e}", exc_info=True)
+        typer.echo(f"[!] Scan failed: {e}")
+        raise typer.Exit(1)
 
 
 if __name__ == "__main__":

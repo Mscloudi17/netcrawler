@@ -3,8 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 import re
+import logging
 from urllib.parse import urlparse
 from core.scope import ScopeManager
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -72,16 +75,64 @@ class ScanContext:
 
     @staticmethod
     def _resolve(target: str) -> tuple[str, str, bool]:
+        """
+        Parse target into (host, url, is_web).
+        
+        Args:
+            target: URL, domain name, or IP address (possibly with CIDR notation)
+            
+        Returns:
+            (host, url, is_web) tuple
+        """
+        if not target or not isinstance(target, str):
+            logger.warning(f"Invalid target: {target}")
+            return str(target), "", False
+            
+        target = target.strip()
+        
+        # Check if it's a URL
         parsed = urlparse(target)
         if parsed.scheme in ("http", "https") and parsed.netloc:
             return parsed.netloc, target, True
-        if "." in target and not re.match(r"^\d+\.\d+\.\d+\.\d+(/|$)", target) and "/" not in target:
-            return target, f"https://{target}", True
+        
+        # Check if it looks like a domain (has dot, not an IP, no path)
+        if "." in target and "/" not in target:
+            # Exclude CIDR ranges and pure IPs
+            if not re.match(r"^\d+\.\d+\.\d+\.\d+(/\d+)?$", target):
+                return target, f"https://{target}", True
+        
+        # Otherwise treat as IP/CIDR
         return target, "", False
 
     def add_finding(self, **kwargs) -> Finding:
+        """
+        Add a finding to the scan context.
+        De-duplicates based on (title, host, port, url) tuple.
+        
+        Args:
+            **kwargs: Finding attributes (severity, title, description, etc.)
+            
+        Returns:
+            The Finding object (new or existing duplicate)
+        """
+        # Extract dedup key
+        title = kwargs.get("title", "")
+        host = kwargs.get("host", "")
+        port = kwargs.get("port")
+        url = kwargs.get("url", "")
+        dedup_key = (title, host, port, url)
+        
+        # Check for duplicate
+        for existing in self.findings:
+            existing_key = (existing.title, existing.host, existing.port, existing.url)
+            if existing_key == dedup_key:
+                logger.debug(f"Duplicate finding skipped: {title} at {host}:{port}")
+                return existing
+        
+        # Add new finding
         f = Finding(**kwargs)
         self.findings.append(f)
+        logger.debug(f"Finding added: {title} (severity={f.severity})")
         return f
 
     def severity_counts(self) -> dict[str, int]:

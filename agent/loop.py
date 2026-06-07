@@ -1,6 +1,7 @@
 """Agent loop — observe → think → act → repeat."""
 from __future__ import annotations
 import time
+import logging
 from typing import Callable
 from core.context import ScanContext
 from agent.ollama import OllamaClient, AgentDecision
@@ -21,6 +22,8 @@ from modules.services.redis import run_redis_enum
 from modules.services.mongodb import run_mongodb_enum
 from output.reporter import generate_report
 from utils.rate_limiter import limiter
+
+logger = logging.getLogger(__name__)
 
 TOOL_MAP: dict[str, Callable[[ScanContext, Callable], str]] = {
     "passive_recon":   run_passive_recon,
@@ -74,82 +77,101 @@ class AgentLoop:
                 f"Ollama not reachable at {self.llm.host}. "
                 "Start Ollama with: ollama serve"
             )
+            logger.error(f"Ollama unavailable at {self.llm.host}")
             return
 
         for iteration in range(MAX_ITERATIONS):
             if self._timed_out():
+                logger.info("Scan timeout reached")
                 self.on_timeout()
                 generate_report(self.ctx)
                 self.on_done()
                 return
 
-            summary  = self.ctx.summary_for_llm()
-            decision = self.llm.decide(summary, self.history)
+            try:
+                summary  = self.ctx.summary_for_llm()
+                decision = self.llm.decide(summary, self.history)
 
-            self.ctx.agent_thoughts.append(decision.thought)
-            self.on_thought(decision.thought, decision.reason)
+                self.ctx.agent_thoughts.append(decision.thought)
+                self.on_thought(decision.thought, decision.reason)
+                logger.debug(f"Agent decision: action={decision.action}")
 
-            if decision.action in ("done", "report") or not decision.action:
-                generate_report(self.ctx)
-                self.on_done()
-                return
+                if decision.action in ("done", "report") or not decision.action:
+                    logger.info("Agent decided to finish scan")
+                    generate_report(self.ctx)
+                    self.on_done()
+                    return
 
-            # Fuzzy match
-            tool_fn = TOOL_MAP.get(decision.action)
-            if tool_fn is None:
-                normalised = decision.action.replace("-", "_").strip()
-                if normalised in TOOL_MAP:
-                    decision.action = normalised
-                    tool_fn = TOOL_MAP[normalised]
-                else:
-                    self.on_error(f"Unknown action: {decision.action!r}")
+                # Fuzzy match
+                tool_fn = TOOL_MAP.get(decision.action)
+                if tool_fn is None:
+                    normalised = decision.action.replace("-", "_").strip()
+                    if normalised in TOOL_MAP:
+                        decision.action = normalised
+                        tool_fn = TOOL_MAP[normalised]
+                    else:
+                        error_msg = f"Unknown action: {decision.action!r}"
+                        self.on_error(error_msg)
+                        logger.warning(error_msg)
+                        self.history.append({
+                            "role": "user",
+                            "content": (
+                                f"{decision.action!r} is not valid. "
+                                f"Valid tools: {', '.join(TOOL_MAP.keys())}."
+                            ),
+                        })
+                        continue
+
+                if decision.action in self.ctx.completed_stages:
+                    remaining = [t for t in TOOL_MAP if t not in self.ctx.completed_stages]
+                    msg = f"{decision.action} already completed"
+                    logger.info(msg)
                     self.history.append({
                         "role": "user",
                         "content": (
-                            f"{decision.action!r} is not valid. "
-                            f"Valid tools: {', '.join(TOOL_MAP.keys())}."
+                            f"{decision.action} already completed. "
+                            f"Remaining: {', '.join(remaining) or 'none — call done'}."
                         ),
                     })
                     continue
 
-            if decision.action in self.ctx.completed_stages:
-                remaining = [t for t in TOOL_MAP if t not in self.ctx.completed_stages]
-                self.history.append({
-                    "role": "user",
-                    "content": (
-                        f"{decision.action} already completed. "
-                        f"Remaining: {', '.join(remaining) or 'none — call done'}."
-                    ),
-                })
-                continue
+                self.on_action(decision.action)
+                logger.info(f"Running tool: {decision.action}")
 
-            self.on_action(decision.action)
+                def status_cb(msg: str):
+                    self.on_thought(msg, "")
 
-            def status_cb(msg: str):
-                self.on_thought(msg, "")
+                try:
+                    raw_output = tool_fn(self.ctx, status_cb)
+                    self.ctx.tool_outputs[decision.action] = raw_output
+                    self.ctx.completed_stages.append(decision.action)
+                    logger.info(f"Tool succeeded: {decision.action}")
 
-            try:
-                raw_output = tool_fn(self.ctx, status_cb)
-                self.ctx.tool_outputs[decision.action] = raw_output
-                self.ctx.completed_stages.append(decision.action)
+                    interpretation = self.llm.interpret(
+                        decision.action, raw_output, self.ctx.summary_for_llm()
+                    )
+                    self.on_result(decision.action, interpretation)
 
-                interpretation = self.llm.interpret(
-                    decision.action, raw_output, self.ctx.summary_for_llm()
-                )
-                self.on_result(decision.action, interpretation)
+                    self.history.append({
+                        "role": "assistant",
+                        "content": f"Ran {decision.action}. Findings:\n{interpretation}",
+                    })
 
-                self.history.append({
-                    "role": "assistant",
-                    "content": f"Ran {decision.action}. Findings:\n{interpretation}",
-                })
+                except Exception as e:
+                    err = f"{decision.action} failed: {e}"
+                    self.on_error(err)
+                    logger.error(f"Tool execution error: {err}", exc_info=True)
+                    self.history.append({"role": "assistant", "content": err})
+                    # Note: NOT marking as completed — allows retry in next iteration if LLM decides
+
+                limiter.wait()
 
             except Exception as e:
-                err = f"{decision.action} failed: {e}"
-                self.on_error(err)
-                self.history.append({"role": "assistant", "content": err})
-                self.ctx.completed_stages.append(decision.action)
+                loop_error = f"Agent loop error: {e}"
+                self.on_error(loop_error)
+                logger.error(loop_error, exc_info=True)
+                break
 
-            limiter.wait()
-
+        logger.info("Max iterations reached")
         generate_report(self.ctx)
         self.on_done()
